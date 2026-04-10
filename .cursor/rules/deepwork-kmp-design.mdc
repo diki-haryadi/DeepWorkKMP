@@ -1,0 +1,28 @@
+---
+description: Konvensi Kotlin Multiplatform, design system Deep Work, dan Compose Material3 untuk proyek ini
+alwaysApply: true
+---
+
+# Deep Work — aturan proyek & design system
+
+## Arsitektur KMP
+
+- UI bersama di `composeApp/src/commonMain`. Target-spesifik hanya di `androidMain`, `jvmMain`, atau folder target lain bila ditambahkan.
+- Gunakan `expect` / `actual` untuk perilaku platform (misalnya skema warna dinamis di Android). Jangan menduplikasi logika platform di composable fitur.
+- Asset Compose (gambar, font) di `composeApp/src/commonMain/composeResources/`. Font baru hanya lewat `composeResources/font/` dan diterapkan di layer tema.
+
+## Design system
+
+- Bungkus hierarki UI aplikasi dengan `DeepWorkTheme` dari `co.id.relay.digitals.theme`. Jangan memakai `MaterialTheme { }` mentah di root `App` atau layar utama.
+- Warna: selalu dari `MaterialTheme.colorScheme` atau dari `rememberDeepWorkColorScheme` / fungsi di `DeepWorkColors.kt`. Jangan menyebarkan literal `Color(0xFF...)` di composable fitur.
+- Tipografi: gunakan `MaterialTheme.typography`. Penyesuaian font hanya di `DeepWorkTypography.kt` (memuat font dari resources dengan `Font(Res.font.*)` di dalam `@Composable`).
+- Di Android 12+ (API 31+), palet mengikuti **Dynamic Color** lewat `actual` di `androidMain`; desktop (JVM) tetap skema statis Deep Work.
+
+## Paket & struktur
+
+- Paket dasar: `co.id.relay.digitals`. Subpaket disarankan: `theme` untuk tema, `feature.<nama>` untuk fitur, atau pola yang konsisten seiring pertumbuhan codebase.
+- Utamakan komponen **Material 3** (`androidx.compose.material3`) yang sudah tercantum di dependencies modul.
+
+## Pratinjau & pengujian
+
+- Setelah mengubah tema atau resources, verifikasi dengan `./gradlew :composeApp:assembleDebug` (Android) dan build JVM/desktop sesuai kebutuhan.
