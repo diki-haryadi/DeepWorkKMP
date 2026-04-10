@@ -2,6 +2,7 @@ package co.id.relay.digitals.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,6 +23,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -34,6 +37,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -43,17 +47,22 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import co.id.relay.digitals.data.SettingsRepository
 import co.id.relay.digitals.domain.CaptureNote
 import co.id.relay.digitals.domain.DayRoutineState
+import co.id.relay.digitals.domain.DoneTaskEntry
 import co.id.relay.digitals.domain.SessionLog
 import co.id.relay.digitals.domain.TaskItem
 import co.id.relay.digitals.domain.TaskType
+import co.id.relay.digitals.domain.formatDoneTaskTimestamp
 import co.id.relay.digitals.domain.nowEpochMs
 import co.id.relay.digitals.domain.todayLocalDate
 import co.id.relay.digitals.platform.Notifier
@@ -100,6 +109,9 @@ fun AppRoot() {
                 val loaded = repository.loadTopThreeTomorrow()
                 repeat(3) { index -> add(loaded.getOrNull(index).orEmpty()) }
             }
+        }
+        val doneTaskHistory = remember {
+            mutableStateListOf<DoneTaskEntry>().apply { addAll(repository.loadDoneTaskHistory()) }
         }
         var deepMinutes by remember { mutableIntStateOf(repository.loadDeepMinutes()) }
         var breakMinutes by remember { mutableIntStateOf(repository.loadBreakMinutes()) }
@@ -154,6 +166,7 @@ fun AppRoot() {
                     MainTab.Plan -> PlanScreen(
                         tasks = tasks,
                         topThree = topThree,
+                        doneTaskHistory = doneTaskHistory.toList(),
                         onTasksUpdated = {
                             tasks.clear()
                             tasks.addAll(it)
@@ -163,6 +176,29 @@ fun AppRoot() {
                             topThree.clear()
                             topThree.addAll(it)
                             repository.saveTopThreeTomorrow(topThree.toList())
+                        },
+                        onArchiveCompletedTask = { task ->
+                            val entry = DoneTaskEntry(
+                                id = "${nowEpochMs()}_${task.id}",
+                                title = task.title,
+                                type = task.type,
+                                completedAtEpochMs = nowEpochMs(),
+                            )
+                            doneTaskHistory.add(0, entry)
+                            while (doneTaskHistory.size > 300) {
+                                doneTaskHistory.removeAt(doneTaskHistory.lastIndex)
+                            }
+                            repository.saveDoneTaskHistory(doneTaskHistory.toList())
+                            tasks.removeAll { it.id == task.id }
+                            repository.saveTasks(tasks.toList())
+                            val cleared = (0 until 3).map { i ->
+                                val slot = topThree.getOrNull(i).orEmpty()
+                                if (slot == task.title) "" else slot
+                            }
+                            topThree.clear()
+                            topThree.addAll(cleared)
+                            repository.saveTopThreeTomorrow(topThree.toList())
+                            insightMessage = "Disimpan ke riwayat selesai"
                         },
                     )
 
@@ -296,12 +332,23 @@ private fun SessionScreen(
     }
 }
 
+private fun normalizeTopThree(top: List<String>): List<String> =
+    (0..2).map { i -> top.getOrElse(i) { "" } }
+
+private class TopThreeDragSession {
+    var buffer: MutableList<String>? = null
+    var dragFromIndex: Int? = null
+    var accumulatedY = 0f
+}
+
 @Composable
 private fun PlanScreen(
     tasks: List<TaskItem>,
     topThree: List<String>,
+    doneTaskHistory: List<DoneTaskEntry>,
     onTasksUpdated: (List<TaskItem>) -> Unit,
     onTopThreeUpdated: (List<String>) -> Unit,
+    onArchiveCompletedTask: (TaskItem) -> Unit,
 ) {
     var newTaskTitle by rememberSaveable { mutableStateOf("") }
     var deepTask by rememberSaveable { mutableStateOf(true) }
@@ -310,6 +357,16 @@ private fun PlanScreen(
     val shallowCount = tasks.count { it.type == TaskType.Shallow }
     val estimatedFocus = deepCount * 90
     val bufferPercent = (100 - ((estimatedFocus / 480f) * 100f)).toInt().coerceIn(0, 100)
+
+    var localTopThree by remember { mutableStateOf(normalizeTopThree(topThree)) }
+    LaunchedEffect(topThree) {
+        localTopThree = normalizeTopThree(topThree)
+    }
+    fun commitTopThree(value: List<String>) {
+        val n = normalizeTopThree(value)
+        localTopThree = n
+        onTopThreeUpdated(n)
+    }
 
     ScrollPage("Planning") {
         Text("Maksimal 3-5 task utama per hari", style = MaterialTheme.typography.titleMedium)
@@ -343,9 +400,27 @@ private fun PlanScreen(
 
         Spacer(Modifier.height(12.dp))
         tasks.forEach { item ->
-            ChecklistRow("${item.title} (${item.type.name})", item.done) { checked ->
-                onTasksUpdated(tasks.map { if (it.id == item.id) it.copy(done = checked) else it })
-            }
+            PlanTaskRow(
+                label = "${item.title} (${item.type.name})",
+                checked = item.done,
+                onCheckedChange = { checked ->
+                    onTasksUpdated(tasks.map { if (it.id == item.id) it.copy(done = checked) else it })
+                },
+                onDelete = {
+                    onTasksUpdated(tasks.filter { it.id != item.id })
+                    val cleared = (0 until 3).map { i ->
+                        val slot = localTopThree.getOrElse(i) { "" }
+                        if (slot == item.title) "" else slot
+                    }
+                    commitTopThree(cleared)
+                },
+                onAssignToSlot = { slot ->
+                    val next = localTopThree.toMutableList()
+                    next[slot] = item.title
+                    commitTopThree(next)
+                },
+                onMarkDoneArchive = { onArchiveCompletedTask(item) },
+            )
         }
         Spacer(Modifier.height(12.dp))
         InfoCard("Deep: $deepCount | Shallow: $shallowCount | Buffer tersisa: ~$bufferPercent%")
@@ -356,7 +431,7 @@ private fun PlanScreen(
             onClick = {
                 val pool = tasks.filter { !it.done }.ifEmpty { tasks }
                 val picked = pool.shuffled(Random.Default).take(3).map { it.title }
-                onTopThreeUpdated(
+                commitTopThree(
                     listOf(
                         picked.getOrElse(0) { "" },
                         picked.getOrElse(1) { "" },
@@ -368,16 +443,109 @@ private fun PlanScreen(
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Acak 3 prioritas dari daftar task") }
         Spacer(Modifier.height(4.dp))
-        repeat(3) { idx ->
+        TopThreeReorderableSlots(
+            slots = localTopThree,
+            onSlotsChange = { commitTopThree(it) },
+        )
+        Spacer(Modifier.height(16.dp))
+        Text("Riwayat selesai", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(4.dp))
+        if (doneTaskHistory.isEmpty()) {
+            Text(
+                "Belum ada riwayat. Ketuk Selesai pada task untuk mengarsip (checkbox tetap untuk tandai progres).",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            doneTaskHistory.forEachIndexed { index, entry ->
+                if (index > 0) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                }
+                DoneHistoryRow(entry = entry)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TopThreeReorderableSlots(
+    slots: List<String>,
+    onSlotsChange: (List<String>) -> Unit,
+) {
+    val density = LocalDensity.current
+    val thresholdPx = with(density) { 52.dp.toPx() }
+    val slotsLatest by rememberUpdatedState(slots)
+    val dragSession = remember { TopThreeDragSession() }
+
+    for (idx in 0 until 3) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .width(44.dp)
+                    .pointerInput(idx, thresholdPx) {
+                        detectDragGesturesAfterLongPress(
+                            onDragStart = {
+                                dragSession.buffer = normalizeTopThree(slotsLatest).toMutableList()
+                                dragSession.dragFromIndex = idx
+                                dragSession.accumulatedY = 0f
+                            },
+                            onDrag = { _, dragAmount ->
+                                val buf = dragSession.buffer ?: return@detectDragGesturesAfterLongPress
+                                var di = dragSession.dragFromIndex ?: return@detectDragGesturesAfterLongPress
+                                dragSession.accumulatedY += dragAmount.y
+                                val th = thresholdPx
+                                while (dragSession.accumulatedY > th && di < 2) {
+                                    val t = buf[di]
+                                    buf[di] = buf[di + 1]
+                                    buf[di + 1] = t
+                                    onSlotsChange(buf.toList())
+                                    di += 1
+                                    dragSession.dragFromIndex = di
+                                    dragSession.accumulatedY -= th
+                                }
+                                while (dragSession.accumulatedY < -th && di > 0) {
+                                    val t = buf[di]
+                                    buf[di] = buf[di - 1]
+                                    buf[di - 1] = t
+                                    onSlotsChange(buf.toList())
+                                    di -= 1
+                                    dragSession.dragFromIndex = di
+                                    dragSession.accumulatedY += th
+                                }
+                            },
+                            onDragEnd = {
+                                dragSession.buffer = null
+                                dragSession.dragFromIndex = null
+                                dragSession.accumulatedY = 0f
+                            },
+                            onDragCancel = {
+                                dragSession.buffer = null
+                                dragSession.dragFromIndex = null
+                                dragSession.accumulatedY = 0f
+                            },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "⋮⋮",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 12.dp),
+                )
+            }
             OutlinedTextField(
-                value = topThree.getOrElse(idx) { "" },
+                value = slots.getOrElse(idx) { "" },
                 onValueChange = { value ->
-                    val next = topThree.toMutableList()
+                    val next = normalizeTopThree(slots).toMutableList()
                     next[idx] = value
-                    onTopThreeUpdated(next)
+                    onSlotsChange(next)
                 },
                 label = { Text("Prioritas ${idx + 1}") },
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                modifier = Modifier.weight(1f).padding(vertical = 4.dp),
             )
         }
     }
@@ -512,6 +680,78 @@ private fun ChecklistRow(text: String, checked: Boolean, onCheckedChange: (Boole
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Checkbox(checked = checked, onCheckedChange = onCheckedChange)
         Text(text)
+    }
+}
+
+@Composable
+private fun PlanTaskRow(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    onDelete: () -> Unit,
+    onAssignToSlot: (Int) -> Unit,
+    onMarkDoneArchive: () -> Unit,
+) {
+    var prioritasOpen by remember { mutableStateOf(false) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+            Text(label, modifier = Modifier.weight(1f))
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box {
+                TextButton(onClick = { prioritasOpen = true }) { Text("Prioritas") }
+                DropdownMenu(
+                    expanded = prioritasOpen,
+                    onDismissRequest = { prioritasOpen = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Prioritas 1") },
+                        onClick = {
+                            onAssignToSlot(0)
+                            prioritasOpen = false
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Prioritas 2") },
+                        onClick = {
+                            onAssignToSlot(1)
+                            prioritasOpen = false
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Prioritas 3") },
+                        onClick = {
+                            onAssignToSlot(2)
+                            prioritasOpen = false
+                        },
+                    )
+                }
+            }
+            TextButton(onClick = onMarkDoneArchive) { Text("Selesai") }
+            TextButton(onClick = onDelete) { Text("Hapus") }
+        }
+    }
+}
+
+@Composable
+private fun DoneHistoryRow(entry: DoneTaskEntry) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Text(entry.title, style = MaterialTheme.typography.bodyLarge)
+        Text(
+            "${entry.type.name} · ${formatDoneTaskTimestamp(entry.completedAtEpochMs)}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

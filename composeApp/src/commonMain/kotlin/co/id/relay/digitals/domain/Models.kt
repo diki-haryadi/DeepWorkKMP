@@ -1,5 +1,6 @@
 package co.id.relay.digitals.domain
 
+import kotlinx.datetime.Instant
 import kotlinx.datetime.LocalDate
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
@@ -18,6 +19,22 @@ data class TaskItem(
 enum class TaskType {
     Deep,
     Shallow,
+}
+
+@Serializable
+data class DoneTaskEntry(
+    val id: String,
+    val title: String,
+    val type: TaskType,
+    val completedAtEpochMs: Long,
+)
+
+fun formatDoneTaskTimestamp(epochMs: Long): String {
+    val instant = Instant.fromEpochMilliseconds(epochMs)
+    val local = instant.toLocalDateTime(TimeZone.currentSystemDefault())
+    val h = local.hour.toString().padStart(2, '0')
+    val min = local.minute.toString().padStart(2, '0')
+    return "${local.date} $h:$min"
 }
 
 @Serializable
